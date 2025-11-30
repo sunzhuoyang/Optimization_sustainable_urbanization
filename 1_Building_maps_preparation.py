@@ -6,101 +6,155 @@ Created on Mon Aug 29 15:36:40 2022
 
 @author: Janneke van Oorschot, Mike Slootweg
 
+这份脚本的主要作用：
+- 以荷兰各个市镇（municipality）为单位
+- 把 BAG（建筑基础数据）和 PBL 场景（建设/拆除）数据
+  叠加到 100m fishnet 网格上
+- 计算每个网格内建筑占地面积（Ground Area）
+- 按建筑占地规模分级输出（0–1000, 1000–4000, >4000 m2）
 """
 #%% 
 print("1. Package installation & import")
 
+# ArcGIS 的 Python 库，用于各种 GIS 操作（矢量、栅格、空间分析等
 import arcpy, arcinfo
+# pandas / numpy 用于表格和数值运算
 import pandas as pd
 import numpy as np
+# glob / os 用于文件系统操作（遍历文件、路径等）
 import glob, os
 
 from arcpy import env
-from arcpy.sa import *
-from osgeo import gdal
+from arcpy.sa import * # Spatial Analyst 模块（栅格计算等）
+from osgeo import gdal  # GDAL，用于栅格处理
 from os.path import exists
 
+# geopandas 用于操作 shapefile 等矢量数据（与 pandas 很像）
 import geopandas as gpd
 import pandas as pd
 
+# 允许覆盖已有输出
 arcpy.env.overwriteOutput = True
-#Enable ArcGIS extensions
+#Enable ArcGIS extensions# 启用 ArcGIS 的 Spatial Analyst 扩展
 arcpy.CheckOutExtension("Spatial")
 
 #%% 
 print("2. Load data and parameters")
 
-# Set directory
+# Set directory # 设置主数据目录（所有路径基于这个）
 directory = "E:/Paper IV/Data/"
 
+
+# ============================================================
+# 2.1 读取市镇边界，并清洗字段名称
+# ============================================================
 # Creating a list of municipality names --------------------------------------------------------------------------------
+# 读取 CBS 的市镇 shapefile
 muniii = gpd.read_file(directory + "GIS_data/CBS_gemeente/CBS_gemeente.shp")
+# 对 'statnaam' 字段做字符替换，避免后面生成文件名时出问题
 muniii['statnaam'] = muniii['statnaam'].str.replace('-', '_')
 muniii['statnaam'] = muniii['statnaam'].str.replace('(', '_')
 muniii['statnaam'] = muniii['statnaam'].str.replace(')', '_')
 muniii['statnaam'] = muniii['statnaam'].str.replace('"', '_')
 muniii['statnaam'] = muniii['statnaam'].str.replace('.', '_')
 muniii['statnaam'] = muniii['statnaam'].str.replace(',', '_')
+# 手动修正几个特殊市镇名称（荷兰城市名）
 muniii.at[292,'statnaam'] = '_s_Gravenhage'
 muniii.at[187,'statnaam'] = '_s_Hertogenbosch'
 muniii.at[243,'statnaam'] = 'Bergen _L_'
 muniii.at[188,'statnaam'] = 'Bergen _NH_'
 
+# 保存清洗后的市镇 shapefile，为后续 ArcPy 使用
 muniii.to_file(directory+'GIS_data/CBS_Gemeente/Municipalities.shp')
 
+# 创建一个排序后的市镇名称列表（用于循环）
 munlist_unsorted = list(muniii['statnaam'])
 munlist = sorted(munlist_unsorted)
 
+# 再拷贝一份，专门把空格替换为下划线，用于生成中间输出名
 muniii_copy = muniii.copy()
 muniii_copy['statnaam'] = muniii_copy['statnaam'].str.replace(' ', '_')
 munlist_copy_unsorted = list(muniii_copy['statnaam'])
 munlist_adj = sorted(munlist_copy_unsorted)
 
-# Model gestopt bij Zeist, bij hervatten beginnen bij. 
+# 如果模型中途在某个市镇停了，可以通过切片从中间继续跑 # Model gestopt bij Zeist, bij hervatten beginnen bij. 
 #munlist = munlist[333:]
 #munlist_adj = munlist_adj[333:]
 
+# ============================================================
+# 2.2 基础 GIS 数据路径（fishnet 网格 & 市镇面）
+# ============================================================
+# 100m fishnet 网格（全国统一网格）
 fishnet = directory + "GIS_data/Fishnet/Fishnet_100m.shp"
+# 市镇多边形（上一步保存的）
 municipality = directory + "GIS_data/CBS_gemeente/Municipalities.shp"
 
+
+# ============================================================
+# 2.3 读取 Excel 参数：不同建筑类型的占地系数等
+# ============================================================
 #read csv that contains the factors for the scenarios
 #factors = pd.read_excel(directory + "Documents/Data/Grondoppervlak_scenarios.xlsx", sheet_name = 'simplified')
 factors = pd.read_excel(directory+"Excel_data/BGA.xlsx", sheet_name = 'Totals')
+
+# 把某一列设为 index，方便后面用 .loc 按行名取值
 factors = factors.set_index('Unnamed: 0')
 # header = pd.MultiIndex.from_product([['low_rise', 'mid_rise', 'high_rise'], ['BAU','small','large']], names = ['height','UFA'])
 
+# ============================================================
+# 2.4 预设场景参数
+# ============================================================
 # Parameters -------------------------------------------------------------------------------------------------
+# WLO 场景（这里只用 'hoog'，即高情景）
 WLO = ['hoog']
+# PBL 情景：靠近（DichtBij）、宽松（Ruim）
 scenario = ['_DichtBij', '_Ruim']
+# 活动类型：建设、拆除（暂时没直接用到）
 activiteit = ['Bouw', 'Sloop']
 
+# ============================================================
+# 2.5 建筑类型列表（荷兰 BAG / PBL 分类）
+# ============================================================
 # Classifciations used in PBL + BAG analysis
 #gebouwtypen = ['appartement', 'Detailhandel', 'Kantoor', 'losstaand', 'NijverheidEnLogistiek', 'Overheid_kw_diensten',  'rijtjeswoning']
 # BAG 
+# BAG 建筑类型
 gebouwtypen = ['appartement', 'bedrijfshal', 'distributie', 'kantoor_groot', 'kantoor_klein', 'onderwijs', 'serieel', 'vrijstaand', 'winkel', 'woonflat']
 
+
+# ============================================================
+# 2.6 UFA（使用面积）情景和建筑高度情景
+# ============================================================
 # UFA scenarios ---------------------------------------------------------------------------------------------------
 # Ground area per residential building type (non-residential building data is already provided in m2 footprint) 
+# Ground area per residential building type (住宅的建筑占地系数)
+# 非住宅建筑（比如工业、办公）占地信息已经直接给到 m² footprint
 UFA_scenarios = ['BAU']#,'small', 'large']
-height_scenarios = ['low_rise']#,'high_rise']# 'mid_rise', 'high_rise'] # only applies for apartments & offices
+# 建筑高度情景，目前只算 'low_rise'，可以扩展 'mid_rise', 'high_rise'
+height_scenarios = ['low_rise']#,'high_rise']# 'mid_rise', 'high_rise'] # only applies for apartments & offices# 只对公寓和办公有效
         
-#%%
+#%% #%% 主循环开始
 print('2. Loop trough each municipality, and add BAG & PBL info to fishnet')      
-for m, m_adj in zip(munlist, munlist_adj):
-    print('Step 2, starting with municipality:')
+
+# 这里通过 zip 把原始市镇名（munlist）和替换空格后的（munlist_adj）配对for m, m_adj in zip(munlist, munlist_adj):
+    print('Step 2, starting with municipality:')# 当前处理哪个市镇
     print(m)
     municipality_name = m
-    
+     # 当前市镇对应的 BAG 数据（已经预处理过，按市镇分好）
     BAG_municipality = directory + "GIS_data/GIS_building_data_output/BAG_per_municipality_reclassified_materialized/" + municipality_name + "_voorraden"
     
     # Define the municipality and make selection according to given municipality name
     # after this, geodatabase files are created using the name of the municipality.
     # 'inter_gdb' is used for intermediate data and steps
     # 'results_gdb' is used for final datasets
-    
+    # ============================================================
+    # 2.x 为当前市镇创建中间 & 结果 geodatabase
+    # ============================================================
+
+    # 用于 Select 的查询语句（按市镇名称筛选）
     search_name = "statnaam = " + "'" + municipality_name + "'" 
     # The exists tool checks if the directory exists. 
-    # With the if-statement we check whether directory,if not, it creates a new one.
+    # With the if-statement we check whether directory,if not, it creates a new one. # 判断中间 geodatabase 是否存在，不存在则创建
     inter_gdb_exists = exists(directory +"GIS_data/footprint_municipality/" + municipality_name + "_intermediate.gdb")
     results_gdb_exists = exists(directory +"GIS_data/footprint_municipality/"+ municipality_name + "_results.gdb")
     
@@ -109,15 +163,17 @@ for m, m_adj in zip(munlist, munlist_adj):
     
     if results_gdb_exists == False:
         arcpy.CreateFileGDB_management(directory + "GIS_data/footprint_municipality/", municipality_name + "_results.gdb")
-    
+    # 中间数据 gdb 和结果 gdb 的路径（字符串末尾加 / 便于后面拼路径）
     # Creating geodatabase files for intermediate output and for final results, for municipality x
     inter_gdb = directory + "GIS_data/footprint_municipality/" + municipality_name + "_intermediate.gdb/"
     results_gdb = directory + "GIS_data/footprint_municipality/" + municipality_name + "_results.gdb/"
     
-    # Folder for shapefiles
+    # 为当前市镇创建一个 shapefile 输出文件夹（存最终 shp） # Folder for shapefiles
     arcpy.management.CreateFolder(directory+'GIS_data/footprint_municipality/', municipality_name)
     
-    # Search municipality field according to the given municipality name    
+    # ============================================================
+    # 2.x 从全国市镇图层中，选出当前市镇的 polygon
+    # ============================================================ # Search municipality field according to the given municipality name    
     municipality_selection = arcpy.analysis.Select(municipality, directory+ 'GIS_data/footprint_municipality/'+municipality_name+'_intermediate.gdb/'+ m_adj+'selection' , "statnaam = '{}'".format(municipality_name))
                                                       
     # Make fishnet selection of the new municipality shapefile
@@ -125,7 +181,9 @@ for m, m_adj in zip(munlist, munlist_adj):
     # Selecting by location is applied to keep all the squares fully around the edges.
     fishnet_selection = arcpy.management.SelectLayerByLocation(fishnet, "HAVE_THEIR_CENTER_IN", municipality_selection,None, "NEW_SELECTION", "NOT_INVERT")
     arcpy.CopyFeatures_management(fishnet_selection, inter_gdb + "fishnet_selection")
-    
+     # ============================================================
+    # 2.x 用当前市镇 polygon 去选取 fishnet 网格
+    # ============================================================ # 选择 fishnet 中中心点落在市镇范围内的格子
     fishnet_BAG = arcpy.CopyFeatures_management(fishnet_selection, inter_gdb + "fishnet_BAG")
 
     # Prepare BAG dataset of municipality 
@@ -422,4 +480,5 @@ arcpy.management.Merge(list_BAG_merge, directory+'GIS_data/footprint_municipalit
 #         print("Field exists")
 #         x = True  
 # if x == False:
+
 #     print("Field does not exist")
