@@ -42,7 +42,7 @@ arcpy.CheckOutExtension("Spatial")
 print("2. Load data and parameters")
 
 # Set directory # 设置主数据目录（所有路径基于这个）
-directory = "E:/Paper IV/Data/"
+  directory = "D:/Users/szy_1/Downloads/20251208_TEST/Data/"
 
 
 # ============================================================
@@ -482,3 +482,4 @@ arcpy.management.Merge(list_BAG_merge, directory+'GIS_data/footprint_municipalit
 # if x == False:
 
 #     print("Field does not exist")
+
